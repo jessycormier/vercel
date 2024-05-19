@@ -1,10 +1,10 @@
-import fs, { readJSON } from 'fs-extra';
+import fs from 'fs-extra';
 import chalk from 'chalk';
 import dotenv from 'dotenv';
 import semver from 'semver';
 import minimatch from 'minimatch';
 import { join, normalize, relative, resolve, sep } from 'path';
-import frameworks from '@vercel/frameworks';
+import { frameworkList } from '@vercel/frameworks';
 import {
   getDiscontinuedNodeVersions,
   normalizePath,
@@ -21,7 +21,8 @@ import {
   NowBuildError,
   Cron,
   validateNpmrc,
-  Flag,
+  type FlagDefinitions,
+  getInstalledPackageVersion,
 } from '@vercel/build-utils';
 import {
   detectBuilders,
@@ -42,7 +43,7 @@ import type { VercelConfig } from '@vercel/client';
 import pull from '../pull';
 import { staticFiles as getFiles } from '../../util/get-files';
 import Client from '../../util/client';
-import getArgs from '../../util/get-args';
+import { parseArguments } from '../../util/get-args';
 import cmd from '../../util/output/cmd';
 import * as cli from '../../util/pkg-name';
 import cliPkg from '../../util/pkg';
@@ -65,13 +66,13 @@ import {
 import { importBuilders } from '../../util/build/import-builders';
 import { initCorepack, cleanupCorepack } from '../../util/build/corepack';
 import { sortBuilders } from '../../util/build/sort-builders';
-import { toEnumerableError } from '../../util/error';
+import { handleError, toEnumerableError } from '../../util/error';
 import { validateConfig } from '../../util/validate-config';
 import { setMonorepoDefaultSettings } from '../../util/build/monorepo';
 import { help } from '../help';
 import { buildCommand } from './command';
 import { scrubArgv } from '../../util/build/scrub-argv';
-import { cwd } from 'process';
+import { getFlagsSpecification } from '../../util/get-flags-specification';
 
 type BuildResult = BuildResultV2 | BuildResultV3;
 
@@ -95,7 +96,6 @@ interface BuildOutputConfig {
     version: string;
   };
   crons?: Cron[];
-  flags?: Flag[];
 }
 
 /**
@@ -134,22 +134,26 @@ export default async function main(client: Client): Promise<number> {
     process.env.__VERCEL_BUILD_RUNNING = '1';
   }
 
-  // Parse CLI args
-  const argv = getArgs(client.argv.slice(2), {
-    '--output': String,
-    '--prod': Boolean,
-    '--yes': Boolean,
-    '-y': '--yes',
-  });
+  let parsedArgs = null;
 
-  if (argv['--help']) {
+  const flagsSpecification = getFlagsSpecification(buildCommand.options);
+
+  // Parse CLI args
+  try {
+    parsedArgs = parseArguments(client.argv.slice(2), flagsSpecification);
+  } catch (error) {
+    handleError(error);
+    return 1;
+  }
+
+  if (parsedArgs.flags['--help']) {
     output.print(help(buildCommand, { columns: client.stderr.columns }));
     return 2;
   }
 
   // Build `target` influences which environment variables will be used
-  const target = argv['--prod'] ? 'production' : 'preview';
-  const yes = Boolean(argv['--yes']);
+  const target = parsedArgs.flags['--prod'] ? 'production' : 'preview';
+  const yes = Boolean(parsedArgs.flags['--yes']);
 
   try {
     await validateNpmrc(cwd);
@@ -214,8 +218,8 @@ export default async function main(client: Client): Promise<number> {
 
   // Delete output directory from potential previous build
   const defaultOutputDir = join(cwd, projectRootDirectory, OUTPUT_DIR);
-  const outputDir = argv['--output']
-    ? resolve(argv['--output'])
+  const outputDir = parsedArgs.flags['--output']
+    ? resolve(parsedArgs.flags['--output'])
     : defaultOutputDir;
   await Promise.all([
     fs.remove(outputDir),
@@ -254,8 +258,11 @@ export default async function main(client: Client): Promise<number> {
       output.debug(`Loaded environment variables from "${envPath}"`);
     }
 
-    // For Vercel Legacy speed Insights support
+    // For legacy Speed Insights
     if (project.settings.analyticsId) {
+      // we pass the env down to the builder
+      // inside the builder we decide if we want to keep it or not
+
       envToUnset.add('VERCEL_ANALYTICS_ID');
       process.env.VERCEL_ANALYTICS_ID = project.settings.analyticsId;
     }
@@ -387,9 +394,7 @@ async function doBuild(
     }
 
     for (const w of detectedBuilders.warnings) {
-      console.log(
-        `Warning: ${w.message} ${w.action || 'Learn More'}: ${w.link}`
-      );
+      output.warn(w.message, null, w.link, w.action || 'Learn More');
     }
 
     if (detectedBuilders.builders) {
@@ -470,7 +475,7 @@ async function doBuild(
   const buildResults: Map<Builder, BuildResult | BuildOutputConfig> = new Map();
   const overrides: PathOverride[] = [];
   const repoRootPath = cwd;
-  const corepackShimDir = await initCorepack({ repoRootPath });
+  const corepackShimDir = await initCorepack({ repoRootPath }, output);
 
   for (const build of sortedBuilders) {
     if (typeof build.src !== 'string') continue;
@@ -550,6 +555,7 @@ async function doBuild(
       // Start flushing the file outputs to the filesystem asynchronously
       ops.push(
         writeBuildResult(
+          repoRootPath,
           outputDir,
           buildResult,
           build,
@@ -586,8 +592,7 @@ async function doBuild(
   }
 
   let needBuildsJsonOverride = false;
-  const speedInsightsVersion = await readInstalledVersion(
-    client,
+  const speedInsightsVersion = await getInstalledPackageVersion(
     '@vercel/speed-insights'
   );
   if (speedInsightsVersion) {
@@ -597,8 +602,7 @@ async function doBuild(
     };
     needBuildsJsonOverride = true;
   }
-  const webAnalyticsVersion = await readInstalledVersion(
-    client,
+  const webAnalyticsVersion = await getInstalledPackageVersion(
     '@vercel/analytics'
   );
   if (webAnalyticsVersion) {
@@ -660,9 +664,8 @@ async function doBuild(
   const mergedWildcard = mergeWildcard(buildResults.values());
   const mergedOverrides: Record<string, PathOverride> =
     overrides.length > 0 ? Object.assign({}, ...overrides) : undefined;
-  const mergedFlags = mergeFlags(buildResults.values());
 
-  const framework = await getFramework(cwd, buildResults);
+  const framework = await getFramework(workPath, buildResults);
 
   // Write out the final `config.json` file based on the
   // user configuration and Builder build results
@@ -674,9 +677,10 @@ async function doBuild(
     overrides: mergedOverrides,
     framework,
     crons: mergedCrons,
-    flags: mergedFlags,
   };
   await fs.writeJSON(join(outputDir, 'config.json'), config, { spaces: 2 });
+
+  await writeFlagsJSON(client, buildResults.values(), outputDir);
 
   const relOutputDir = relative(cwd, outputDir);
   output.print(
@@ -695,7 +699,7 @@ async function getFramework(
 ): Promise<{ version: string } | undefined> {
   const detectedFramework = await detectFrameworkRecord({
     fs: new LocalFileSystemDetector(cwd),
-    frameworkList: frameworks,
+    frameworkList,
   });
 
   if (!detectedFramework) {
@@ -810,36 +814,54 @@ function mergeWildcard(
   return wildcard;
 }
 
-function mergeFlags(
-  buildResults: Iterable<BuildResult | BuildOutputConfig>
-): BuildResultV2Typical['flags'] {
-  return Array.from(buildResults).flatMap(result => {
-    if ('flags' in result) {
-      return result.flags ?? [];
+/**
+ * Takes the build output and writes all the flags into the `flags.json`
+ * file. It'll skip flags that already exist.
+ */
+async function writeFlagsJSON(
+  { output }: Client,
+  buildResults: Iterable<BuildResult | BuildOutputConfig>,
+  outputDir: string
+): Promise<void> {
+  const flagsFilePath = join(outputDir, 'flags.json');
+
+  let hasFlags = true;
+
+  const flags = (await fs.readJSON(flagsFilePath).catch(error => {
+    if (error.code === 'ENOENT') {
+      hasFlags = false;
+      return { definitions: {} };
     }
 
-    return [];
-  });
+    throw error;
+  })) as { definitions: FlagDefinitions };
+
+  for (const result of buildResults) {
+    if (!('flags' in result) || !result.flags || !result.flags.definitions)
+      continue;
+
+    for (const [key, definition] of Object.entries(result.flags.definitions)) {
+      if (result.flags.definitions[key]) {
+        output.warn(
+          `The flag "${key}" was found multiple times. Only its first occurrence will be considered.`
+        );
+        continue;
+      }
+
+      hasFlags = true;
+      flags.definitions[key] = definition;
+    }
+  }
+
+  // Only create the file when there are flags to write,
+  // or when the file already exists.
+  // Checking `definitions` alone won't be enough in case there
+  // are other properties set.
+  if (hasFlags) {
+    await fs.writeJSON(flagsFilePath, flags, { spaces: 2 });
+  }
 }
 
 async function writeBuildJson(buildsJson: BuildsManifest, outputDir: string) {
   await fs.writeJSON(join(outputDir, 'builds.json'), buildsJson, { spaces: 2 });
-}
-
-export async function readInstalledVersion(
-  { output }: Client,
-  pkgName: string
-): Promise<string | undefined> {
-  try {
-    const descriptorPath = require.resolve(`${pkgName}/package.json`, {
-      paths: [cwd()],
-    });
-    const descriptor = await readJSON(descriptorPath);
-    return descriptor?.version;
-  } catch (err) {
-    output.debug(
-      `Package ${pkgName} is not installed (failed to ready its package.json: ${err})`
-    );
-  }
-  return;
 }

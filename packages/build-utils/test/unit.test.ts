@@ -221,6 +221,21 @@ it('should warn when package.json engines is greater than', async () => {
   ]);
 });
 
+it('should warn when project settings gets overrided', async () => {
+  expect(
+    await getNodeVersion(
+      path.join(__dirname, 'pkg-engine-node-greaterthan'),
+      undefined,
+      { nodeVersion: '16.x' },
+      {}
+    )
+  ).toHaveProperty('range', '20.x');
+  expect(warningMessages).toStrictEqual([
+    'Warning: Due to "engines": { "node": ">=16" } in your `package.json` file, the Node.js Version defined in your Project Settings ("16.x") will not apply. Learn More: http://vercel.link/node-version',
+    'Warning: Detected "engines": { "node": ">=16" } in your `package.json` that will automatically upgrade when a new major Node.js Version is released. Learn More: http://vercel.link/node-version',
+  ]);
+});
+
 it('should not warn when package.json engines matches project setting from config', async () => {
   expect(
     await getNodeVersion(
@@ -575,6 +590,28 @@ it(
   },
   ms('1m')
 );
+
+it('should return cliType "npm" when no lockfile is present', async () => {
+  const originalRepoLockfilePath = path.join(
+    __dirname,
+    '..',
+    '..',
+    '..',
+    'pnpm-lock.yaml'
+  );
+  const originalRepoLockfileData = await fs.readFile(originalRepoLockfilePath);
+  await fs.remove(originalRepoLockfilePath);
+  try {
+    const fixture = path.join(__dirname, 'fixtures', '40-no-lockfile');
+    const result = await scanParentDirs(fixture);
+    expect(result.cliType).toEqual('npm');
+    expect(result.lockfileVersion).toEqual(undefined);
+    expect(result.lockfilePath).toEqual(undefined);
+    expect(result.packageJsonPath).toEqual(path.join(fixture, 'package.json'));
+  } finally {
+    await fs.writeFile(originalRepoLockfilePath, originalRepoLockfileData);
+  }
+});
 
 it('should return cliType bun and correct lock file for bun v1', async () => {
   const fixture = path.join(__dirname, 'fixtures', '31-bun-v1-with-yarn-lock');
